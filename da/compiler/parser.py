@@ -30,10 +30,13 @@ from collections import abc
 
 from da import common
 from . import dast
+from . import ruleast
 from .utils import Namespace
 from .utils import CompilerMessagePrinter
 from .utils import MalformedStatementError
 from .utils import ResolverException
+
+from pprint import pprint
 
 # DistAlgo keywords
 KW_ENTRY_POINT = "main"
@@ -76,6 +79,10 @@ KW_NULL = "None"
 KW_SUCH_THAT = "has"
 KW_RESET = "reset"
 KW_INC_VERB = "_INC_"
+
+KW_RULES = "rules"
+KW_COND = "if_"
+KW_INFER = "infer"
 
 ##########################
 # Helper functions:
@@ -957,8 +964,146 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
     def visit_AsyncFunctionDef(self, node):
         self.error('Python async functions are not supported!', node)
 
+
+    # Rules:
+    def create_assersion(self,node,lhs = False):
+        args = []
+        # pprint('============ create_assersion ============')
+        # pprint(node.func.id)
+        # pprint(vars(node))
+        # pprint(vars(node.func))
+        n = self.current_scope.find_name(node.func.id)
+        # pprint(n)
+        if n is not None:
+            if lhs:
+                self.current_process.currentRule['LhsVars'].add(n)
+                self.current_process.currentRule['LhsAry'][n] = len(node.args)
+            else:
+                self.current_process.currentRule['RhsVars'].add(n)
+        else:
+            if lhs:
+                 self.current_process.currentRule['Unboundedleft'].add(node.func.id)
+            else:
+                 self.current_process.currentRule['Unboundedright'].add(node.func.id)
+
+        # self.current_process.currentRule['Unbounded'].add(self.current_process.currentRule['Unboundedright']-)
+
+        # self.current_process.currentRule['RhsVars'] -=  self.current_process.currentRule['LhsVars']
+
+
+        for a in node.args:
+            if isinstance(a,Call):
+                assers = self.create_assersion(a,lhs)
+                args.append(assers)
+            elif isinstance(a, Name):
+                args.append(ruleast.LogicVar(a.id))
+        a = ruleast.Assertion(ruleast.Constant(node.func.id),args)
+
+        return a
+
+
+    def create_condition(self,node):
+        if node.func.id == KW_COND:
+            assersions = []
+            for a in node.args:
+                assers = self.create_assersion(a)
+                assersions.append(assers)
+            return assersions
+        else:
+            self.error('Invalid Rule')
+        
+
+    def visit_Rule(self,node):
+        # pprint(vars(node))
+        r = None
+        if (isinstance(node, Tuple)):   # conclusion, condition
+            concl = self.create_assersion(node.elts[0],True)
+            conds = self.create_condition(node.elts[1])
+            r = ruleast.Rule(concl,conds)
+
+        elif (isinstance(node, Call)):  # only condition
+            conds = self.create_condition(node)
+            r = ruleast.Rule(None,conds)
+
+        # print(r)
+        # print(vars(r))
+        return r
+
+
+    def create_rules(self, rulecls, ast, decls, nopush=False):
+        # pprint(vars(self))
+        self.current_process.currentRule = dict()
+        self.current_process.currentRule['LhsVars'] = set()
+        self.current_process.currentRule['LhsAry'] = dict()
+        self.current_process.currentRule['RhsVars'] = set()
+        self.current_process.currentRule['Unboundedleft'] = set()
+        self.current_process.currentRule['Unboundedright'] = set()
+        self.current_process.currentRule['Unbounded'] = set()
+        rules = []
+        for r in ast.body:
+            rules.append(self.visit_Rule(r.value))
+
+        self.current_process.currentRule['RhsVars'] -= self.current_process.currentRule['LhsVars']
+        self.current_process.currentRule['Unbounded'] = self.current_process.currentRule['Unboundedright'] - self.current_process.currentRule['Unboundedleft']
+        # print('============== create_rules ==============')
+        # pprint(self.current_process.currentRule)
+        if len(self.current_process.currentRule['Unbounded']) == 0:
+            for rv in self.current_process.currentRule['RhsVars']:
+                rv.triggerInfer.add(decls)
+                # print('============== added to triggerInfer ==============')
+                # print(rv)
+
+        # expr = self.create_expr(dast.DictExpr, node)
+        # for key in node.keys:
+        #     expr.keys.append(self.visit(key))
+        # for value in node.values:
+        #     expr.values.append(self.visit(value))
+
+        self.current_process.RuleConfig[decls] = self.current_process.currentRule
+
+        # self.current_process.RuleConfig[decls] = \
+        #     Dict([Str('LhsVars'),Str('LhsAry'),Str('RhsVars'),Str('Unbounded')],
+        #          [Set(self.current_process.currentRule['LhsVars']),
+        #             Dict([keys for keys,_ in self.current_process.currentRule['LhsAry'].items()],[Num(var) for _,var in self.current_process.currentRule['LhsAry'].items()]),
+        #             Set(self.current_process.currentRule['RhsVars']),
+        #             Set(self.current_process.currentRule['Unbounded'])])
+        # print(self.current_process.RuleConfig)
+        rulesobj = rulecls(decls, rules)
+        # print(rulesobj)
+        rulesobj.label = self.current_label
+        self.current_label = None
+
+        if self.current_block is None or self.current_parent is None:
+            self.error("Statement not allowed in this context.", ast)
+        else:
+            self.current_block.append(rulesobj)
+        if not nopush:
+            self.push_state(rulesobj)
+
+        return rulesobj
+
+
     def visit_FunctionDef(self, node):
-        if (self.current_process is None or
+        if (node.name == KW_RULES):
+            numArgs = len(node.args.args)
+            decl = ''
+            if numArgs > 0:
+                for i in range(numArgs):
+                    if node.args.args[i].arg == 'name':
+                        decl = node.args.defaults[i].s
+                        break
+            if not decl:
+                decl = str(self.state_stack[-1][0].name)
+            n = self.current_scope.add_name(node.name)
+            s = self.create_rules(ruleast.Rules, node, decl)
+            # pprint(vars(s))
+            if self.current_process:
+                self.current_process.rules = s
+            self.current_block = s.rules
+            self.pop_state()
+            self._dummy_process = None
+
+        elif (self.current_process is None or
                 node.name not in {KW_SENT_EVENT, KW_RECV_EVENT}):
             # This is a normal method
             if self.current_parent is self.current_process:
@@ -1098,6 +1243,9 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
 
     # Since Python 3.6:
     def visit_AnnAssign(self, node):
+        # print("================= Annotation ==============")
+        # print(node)
+        # pprint(vars(node))
         stmtobj = self.create_stmt(dast.AssignmentStmt, node)
         self.current_context = Assignment(stmtobj,
                                           type=self.visit(node.annotation))
@@ -1538,6 +1686,13 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
     # constructed dast AST node
 
     def visit_Attribute(self, node):
+
+        # pprint('==================== visit_Attribute ====================')
+        # pprint(self)
+        # pprint(node)
+        # pprint(vars(node))
+        # pprint(vars(node.value))
+
         expr = self.create_expr(dast.AttributeExpr, node)
         oldctx = self.current_context
         if (isinstance(self.current_context, FunCall) and
@@ -1586,6 +1741,10 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                     n.add_update(oldctx.node, oldctx.type)
                 else:
                     n.add_read(expr)
+
+            # pprint('==================== visit_Attribute ====================')
+            # pprint(n)
+            # pprint(vars(n._indexes[0][1][0]))
             expr.value = n
             self.pop_state()
         return expr
@@ -1965,6 +2124,22 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
                 res.append((key, value))
         return res
 
+
+    # infer
+    # def parse_infer(self,node):
+    #     # pprint(vars(node))
+    #     try:
+    #         stmtobj = self.create_expr(ruleast.InferStmt, node)
+    #         stmtobj.bindings = self.visit(node.args[0])
+    #         stmtobj.queries = self.visit(node.args[1])
+    #         stmtobj.rule = self.visit(node.args[2])
+    #         self.pop_state()
+    #         # pprint(vars(stmtobj))
+    #         return stmtobj
+    #     except MalformedStatementError as e:
+    #         self.error("malformed statement spec: " + e.reason, e.node)
+
+
     def visit_Call(self, node):
         try:
             if expr_check(Quantifiers, 1, None, node,
@@ -1973,6 +2148,9 @@ class Parser(NodeVisitor, CompilerMessagePrinter):
 
             if expr_check(ComprehensionTypes, 2, None, node):
                 return self.parse_comprehension(node)
+
+            # if expr_check({KW_INFER}, 2, 3, node):
+            #     return self.parse_infer(node)
 
             if self.current_process is not None and \
                expr_check({KW_RECV_QUERY, KW_SENT_QUERY}, 1, 1, node,

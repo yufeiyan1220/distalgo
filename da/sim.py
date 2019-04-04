@@ -38,11 +38,15 @@ import multiprocessing
 import os.path
 
 from . import common, pattern
-from .common import (builtin, internal, name_split_host, name_split_node,
+from .common import (write_file, builtin, internal, name_split_host, name_split_node,
                      ProcessId, get_runtime_option,
                      ObjectDumper, ObjectLoader)
 from .transport import ChannelCaps, TransportManager, HEADER_SIZE, \
     TransportException, AuthenticationException
+
+
+from pprint import pprint
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +88,8 @@ class Command(enum.Enum):
 
 _config_object = dict()
 
+UniqueLowerCasePrefix = 'p'
+
 class DistProcess():
     """Abstract base class for DistAlgo processes.
 
@@ -112,6 +118,8 @@ class DistProcess():
 
     """
     def __init__(self, procimpl, forwarder, **props):
+        # print('sldkjflsjdfs')
+        # print(self._rules_object)
         self.__procimpl = procimpl
         self.__id = procimpl.dapid
         self._log = logging.LoggerAdapter(
@@ -137,6 +145,7 @@ class DistProcess():
         self._events = []
 
         self.__crashing = False
+
 
     def setup(self, **rest):
         """Initialization routine for the DistAlgo process.
@@ -530,6 +539,83 @@ class DistProcess():
         self._register_async_event(Command.EndAck, seqno=0)
         self._sync_async_event(Command.EndAck, seqno=0, srcs=self._id)
 
+
+    @builtin
+    def infer(self, bindings=[], queries=[], rule=None):
+        # set_value = False
+        # self._log.info('infer called')
+        if not rule:
+            rule = self.__class__.__name__
+
+        pprint('=================================== infer ===================================')
+        # pprint(self._rules_object)
+        allBindings = set(b for b,_ in bindings)
+        # allLhs = set(self._rules_object[rule]['LhsVars'].keys())
+        # allqueries
+        if not rule in self._rules_object:
+            raise ValueError("infer: can't find rule: " + rule)
+        for u in self._rules_object[rule]['Unbounded']:
+            if u not in allBindings:
+                raise ValueError("infer: not all predicates bond: " + u)
+
+        for r in self._rules_object[rule]['RhsVars']:
+            if r not in allBindings:
+                bindings.append((r, getattr(getattr(self,'_state'), r)))
+
+        # if len(bindings) == 0:
+        #     for v in _rules_object['RhsVars']:
+        #         bindings.append((v, getattr(self, v)))
+
+        if len(queries) == 0:
+            # qArg = []
+            for v in self._rules_object[rule]['LhsVars']:
+                arity = v[1]
+                qstr = v[0]+'('
+                for i in range(arity-1):
+                    qstr += '_,'
+                if arity > 0:
+                    qstr += '_'
+                qstr += ')'
+                queries.append(qstr)
+
+        
+        xsb_facts = ""
+        for b in bindings:
+            if not isinstance(b[1], list) and not isinstance(b[1], set):
+                if isinstance(b[1], tuple):
+                    xsb_facts += UniqueLowerCasePrefix+b[0]+str(b[1])+'.\n'
+                else:
+                    xsb_facts += UniqueLowerCasePrefix+b[0]+'('+str(b[1])+').\n'
+            else:
+                for v in b[1]:
+                    if isinstance(v, tuple):
+                        xsb_facts += UniqueLowerCasePrefix+b[0]+str(v)+'.\n'
+                    else:
+                        xsb_facts += UniqueLowerCasePrefix+b[0]+'('+str(v)+').\n'
+
+        # print(xsb_facts)
+        write_file(rule+'.facts', xsb_facts)
+
+        results = []
+        for q in queries:
+            xsb_query = "extfilequery_nb:external_file_query('{}',{}).".format(rule,UniqueLowerCasePrefix+q)
+            # print(xsb_query)
+            subprocess.run(["xsb", '-e', "add_lib_dir(a('../xsb')).", "-e", xsb_query])
+            answers = open("{}.answers".format(rule),"r").read()
+            tuples = set(tuple(int(v) for v in a.split(',')) if len(a.split(',')) > 1 else int(a) for a in answers.split("\n")[:-1])
+            results.append(tuples)
+        #         queries.append((v+))
+
+        # for v in 
+        # print('resultsresultsresultsresultsresultsresultsresultsresultsresultsresultsresultsresultsresultsresultsresultsresults')
+        # pprint(results)
+        if len(results) == 0:
+            return results
+        if len(results) == 1:
+            return results[0]
+        return tuple(results)
+
+
     # another option: crash and recover both by messages.
     # @builtin
     # def fakeCrash(self, duration):
@@ -557,7 +643,6 @@ class DistProcess():
     #         #     print (i)
     #     else:
     #         hanged()
-
 
 
     @builtin
